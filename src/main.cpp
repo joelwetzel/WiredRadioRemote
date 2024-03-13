@@ -1,19 +1,15 @@
 #include <Arduino.h>
 #include <Encoder.h>
-#include "pt.h"
-
-// time vars
-static int MinSliceDelay = 1;
 
 // Threading times                                              //  libraries scheduler seem to need different CPUs, and protothread seemed to involved, so just did a simple wait schedule with anti-stravation
-static int WaitForUnitToComplete = 41;       // so far it looks like the Pioneer might need 40msec to respond to the event
+static int WaitForUnitToComplete = 4001;       // so far it looks like the Pioneer might need 40msec to respond to the event
 //static int WaitForDisplayTime = 850;         // was 650        // this should be the minimum time to display the screen
 //static int WaitTimeForBetweenScreens = 4100; // this should be the minimum time for the volume screen to remove after no other commands have been sent
+unsigned long nextCommandTime = 0;
 
-// ProtoThreads
-static struct pt pt1, pt2; // 2 threads, the encodes pt1 thread, and the writing of commands (the multiplexer setter) pt2
-
-long buttonPressMillis = 0;
+long lastActionMillis = 0;
+bool needsReset = false;
+long debounceMillis = WaitForUnitToComplete + 1;
 
 // Pins for rotatary encoder
 #define clkPin D5
@@ -30,7 +26,7 @@ Encoder myEnc(dtPin, clkPin);
 int controlPins[] = {m1, m2, m3};
 
 // Commands.  Map of commands to multiplexer channels.  (With comment for the resistors that should be on that channel.)
-#define DEFAULT 0             // 100 kOhm
+#define DEFAULT_PIN 0             // 100 kOhm
 #define ATT 1                 // 3.5 kOhm
 #define DISPLAY_SONG_TAG 2    // 5.75 kOhm
 #define NEXT 3                // 8 kOhm
@@ -57,109 +53,120 @@ int Channels[8][3] = {          // TODO - add a 4th column, with the delay for e
 //  commands
 void PulseVolumeUp()
 {
+  if (millis() - lastActionMillis < debounceMillis || needsReset)
+  {
+    // Debounce
+    return;
+  }
+
   nextCommand = VOLUME_UP;
+  lastActionMillis = millis();
   Serial.println("PULSE-UP");
 }
 
 void PulseVolumeDown()
 {
+  if (millis() - lastActionMillis < debounceMillis || needsReset)
+  {
+    // Debounce
+    return;
+  }
+
   nextCommand = VOLUME_DOWN;
+  lastActionMillis = millis();
   Serial.println("PULSE-DOWN");
 }
 
 void PulseMute(void)
 {
+  if (millis() - lastActionMillis < debounceMillis || needsReset)
+  {
+    // Debounce
+    return;
+  }
+
   nextCommand = ATT;
+  lastActionMillis = millis();
   Serial.println("PULSE-MUTE");
 }
 
 
 ICACHE_RAM_ATTR void buttonPressed()
 {
-  long now = millis();
-
-  if (now - buttonPressMillis < 100)
-  {
-    // Debounce
-    return;
-  }
-
   PulseMute();
-
-  buttonPressMillis = millis();
 }
 
 
 int encoderValue = 0;
 int lastEncoderValue = 0;
 
-static int protothread1(struct pt *pt)
+void evalEncoder()
 {
-  PT_BEGIN(pt);
+  encoderValue = myEnc.read();
 
-  while (1)
+  if (encoderValue == lastEncoderValue)
   {
-    encoderValue = myEnc.read();
-
-    if (encoderValue - lastEncoderValue > 1)
-    {
-      PulseVolumeUp();
-      lastEncoderValue = encoderValue;
-    }
-    else if (encoderValue - lastEncoderValue < -1)
-    {
-      PulseVolumeDown();
-      lastEncoderValue = encoderValue;
-    }
-
-    PT_YIELD(pt); // allow other thread some time
+    return;
   }
 
-  PT_END(pt);
+  if (encoderValue - lastEncoderValue > 0)
+  {
+    PulseVolumeUp();
+    lastEncoderValue = encoderValue;
+  }
+  else if (encoderValue - lastEncoderValue < 0)
+  {
+    PulseVolumeDown();
+    lastEncoderValue = encoderValue;
+  }
 }
 
 unsigned long timestamp2 = 0;
 
-static int protothread2(struct pt *pt)
+void evalMultiplexer()
 {
-  PT_BEGIN(pt);
-
-  while (1)
+  if (millis() < nextCommandTime)
   {
-    if (nextCommand < 0 || nextCommand > 7)
-    {
-      nextCommand = DEFAULT;
-    }
-
-    // Send the command
-    if (nextCommand != lastCommand)
-    {
-      Serial.println("Command: " + String(nextCommand));
-      lastCommand = nextCommand;
-
-      // Set multiplexer to the channel with the resistance for the command we want.
-      for (int i = 0; i < 3; i++)
-      {
-        digitalWrite(controlPins[i], Channels[nextCommand][i]);
-      }
-
-      // Wait long enough for the stereo to process the command
-      timestamp2 = millis();
-      PT_YIELD_UNTIL(pt, millis() - timestamp2 > WaitForUnitToComplete);
-
-      // Set multiplexer back to the default channel 0 for the next go-round
-      nextCommand = DEFAULT;
-    }
+    return;
   }
 
-  PT_END(pt);
+  if (nextCommand == lastCommand)
+  {
+    return;
+  }
+
+  if (nextCommand < DEFAULT_PIN)
+  {
+    nextCommand = DEFAULT_PIN;
+  }
+
+  // Send the command
+
+  Serial.println("Sending command: " + String(nextCommand));
+
+  // Set multiplexer to the channel with the resistance for the command we want.
+  for (int i = 0; i < 3; i++)
+  {
+    digitalWrite(controlPins[i], Channels[nextCommand][i]);
+  }
+
+  if (nextCommand == DEFAULT_PIN)
+  {
+    needsReset = false;
+  }
+  else
+  {
+    needsReset = true;
+  }
+
+  // Set multiplexer back to the default channel 0 for the next go-round
+  lastCommand = nextCommand;
+  nextCommand = DEFAULT_PIN;
+  nextCommandTime = millis() + WaitForUnitToComplete;
 }
 
 void setup()
 {
-  PT_INIT(&pt1);
-  PT_INIT(&pt2);
-
   // Setup pins for pushbutton on Encoder
   pinMode(swPin, INPUT_PULLUP);
   attachInterrupt(swPin, buttonPressed, RISING);
@@ -175,6 +182,8 @@ void setup()
 
 void loop()
 {
-  PT_SCHEDULE(protothread1(&pt1));
-  PT_SCHEDULE(protothread2(&pt2));
+  evalEncoder();
+  evalMultiplexer();
+
+  delay(1);
 }
